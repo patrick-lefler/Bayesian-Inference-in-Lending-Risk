@@ -1,0 +1,831 @@
+---
+title: "Bayesian Inference in Lending Risk"
+subtitle: "Estimating Interest Rate Drivers with Posterior Distributions"
+author: "Patrick Lefler"
+abstract: "This project applies Bayesian inference to two lending risk questions — whether debt-to-income ratio drives interest rates and whether homeownership status produces meaningful rate differences — using the `loans_full_schema` dataset from the `openintro` package. Using `rstanarm` to fit the models and `bayestestR` to characterise the resulting posterior distributions, it demonstrates how credible intervals, the Region of Practical Equivalence, and the Probability of Direction together provide a richer and more decision-relevant picture of parameter uncertainty than classical frequentist regression."
+date: "13-March 2026"
+format:
+  html:
+    code-fold: true
+    code-tools: false
+    code-copy: false
+    code-overflow: wrap
+    df-print: kable
+    embed-math: true
+    embed-resources: true
+    fig-width: 10
+    fig-height: 5
+    fig-align: center
+    highlight-style: arrow
+    linkcolor: "#0166CC"
+    number-sections: false
+    page-layout: full
+    smooth-scroll: true
+    theme: sandstone
+    toc: true
+    toc-depth: 3
+    toc-location: right
+    toc-title: "Contents"
+execute:
+  echo: true
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    comment: "#>"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(rstanarm)    # Stan-backed Bayesian regression
+library(bayestestR)  # Posterior description & hypothesis testing
+library(insight)     # Uniform parameter extraction
+library(ggplot2)     # Visualisation
+library(kableExtra)  # kable table
+library(openintro)   # Source of loans_full_schema
+library(scales)      # decimal formating
+library(tidyverse)   # Data wrangling
+library(dplyr)       # Data wrangling
+library(tidyr)       # Reshaping
+
+# Sandstone-aligned palette
+plot_background   <-"#FEFEFA" # 
+plot_lightgrey <- "#D3D3D3"
+plot_blue <- "#0166CC"
+plot_red <- "#B94A48"
+plot_beige <- "#FFE2C3"
+clr_dark      <- "#2C2C2C"   # near-black
+aesthetic_1   <- "#AA6F73"
+aesthetic_2   <- "#EEA900"
+aesthetic_3.  <- "#F6E0B5"
+
+theme_lending <- function() {
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title       = element_text(size = 13, color = clr_dark),
+      plot.subtitle    = element_text(size = 10, color = "grey45", margin = margin(b = 10)),
+      plot.caption     = element_text(size = 8, color = "grey55", hjust = 0),
+      axis.title       = element_text(size = 10, color = clr_dark),
+      axis.text        = element_text(size = 9, color = "grey35"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "#CCCCCC"),
+      plot.background  = element_rect(fill = "#FEFEFA", color = NA),
+      panel.background = element_rect(fill = "#FEFEFA", color = NA),
+      legend.position  = "bottom",
+      legend.title     = element_text(size = 9, face = "bold"),
+      legend.text      = element_text(size = 9)
+    )
+}
+
+theme_set(theme_lending())
+
+set.seed(2024)
+options(mc.cores = parallel::detectCores())
+options(scipen=999) ## scientific notional turned off
+```
+
+---
+
+## Motivation and Scope
+
+Interest rates on personal and consumer loans are not arbitrary — they encode
+a lender's assessment of borrower risk, market conditions, and portfolio
+strategy. But *how much* does a given risk factor actually shift the rate a
+borrower receives? And how confident should we be in that estimate?
+
+Classical (frequentist) regression hands us a coefficient and a *p*-value.
+That answers a narrow question: *"Is this effect unlikely under the null
+hypothesis?"* A more useful question for risk practitioners is: *"Given the
+data in front of us, what is the full range of plausible values for this
+effect — and where does most of the probability mass sit?"*
+
+That is the question **Bayesian inference** is built to answer.
+
+This project works through two lending risk models using the
+`loans_full_schema` dataset from the `openintro` package:
+
+- **Model A** — a continuous predictor: how does debt-to-income ratio drive
+  interest rates?
+- **Model B** — a categorical predictor: does homeownership status shift the
+  interest rate a borrower receives?
+
+For both models we extract posterior distributions, characterise their shape
+and centre, construct credible intervals, and apply formal significance
+tests — using `rstanarm` to fit the models and `bayestestR` to interpret them.
+
+
+## Packages and Data
+
+### Libraries
+```{r}
+#| label: libraries
+#
+
+library(bayestestR)  # Posterior description & hypothesis testing
+library(ggplot2)     # Visualisation
+library(insight)     # Uniform parameter extraction
+library(kableExtra)  # kable table 
+library(openintro)   # Source of loans_full_schema
+library(rstanarm)    # Stan-backed Bayesian regression
+library(scales)      # decimal formating
+library(tidyverse)   # Data wrangling
+library(dplyr)       # Data wrangling
+library(tidyr)       # Reshaping
+```
+
+### Dataset Overview
+
+The `loans_full_schema` dataset contains **`r scales::comma(nrow(loans_full_schema))`
+observations** of personal loan applications, each with over 50 variables
+spanning applicant financials, loan characteristics, and credit history. The data comes from [Lending Club](https://www.lendingclub.com/info/statistics.action), which provides a very large, open set of data on the people who received loans through their platform. The dataset is also available directly within the `openintro` R package.
+
+::: {.callout-note icon = false collapse="true"}
+## Loan data from Lending Club (click to expand)
+This data set represents thousands of loans made through the Lending Club platform, which is a platform that allows individuals to lend to other individuals. It is important to keep in mind that this data set only represents loans actually made, i.e. do not mistake this data for loan applications. 
+
+The `loans_full_schema` is a data frame with 10,000 observations on the following 55 variables.
+
+`emp_title` Job title </br>
+`emp_length` Number of years in the job, rounded down. If longer than 10 years, then this is represented by the value 10 </br>
+`state` Two-letter state code </br>
+`homeownership` The ownership status of the applicant's residence </br>
+`annual_income` Annual income </br>
+`verified_income` Type of verification of the applicant's income </br>
+`debt_to_income` Debt-to-income ratio </br>
+`annual_income_joint` If this is a joint application, then the annual income of the two parties applying </br>
+`verification_income_joint` Type of verification of the joint income </br>
+`debt_to_income_joint` Debt-to-income ratio for the two parties </br>
+`delinq_2y` Delinquencies on lines of credit in the last 2 years </br>
+`months_since_last_delinq` Months since the last delinquency </br>
+`earliest_credit_line` Year of the applicant's earliest line of credit </br>
+`inquiries_last_12m` Inquiries into the applicant's credit during the last 12 months </br>
+`total_credit_lines` Total number of credit lines in this applicant's credit history </br>
+`open_credit_lines` Number of currently open lines of credit </br>
+`total_credit_limit` Total available credit, e.g. if only credit cards, then the total of all the credit limits. This excludes a mortgage </br>
+`total_credit_utilized` Total credit balance, excluding a mortgage </br>
+`num_collections_last_12m` Number of collections in the last 12 months. This excludes medical collections </br>
+`num_historical_failed_to_pay` The number of derogatory public records, which roughly means the number of times the applicant failed to pay </br>
+`months_since_90d_late` Months since the last time the applicant was 90 days late on a payment </br>
+`current_accounts_delinq` Number of accounts where the applicant is currently delinquent </br>
+`total_collection_amount_ever` The total amount that the applicant has had against them in collections </br>
+`current_installment_accounts` Number of installment accounts, which are (roughly) accounts with a fixed payment amount and period. A typical example might be a 36-month car loan </br>
+`accounts_opened_24m` Number of new lines of credit opened in the last 24 months </br>
+`months_since_last_credit_inquiry` Number of months since the last credit inquiry on this applicant </br>
+`num_satisfactory_accounts` Number of satisfactory accounts </br>
+`num_accounts_120d_past_due` Number of current accounts that are 120 days past due </br>
+`num_accounts_30d_past_due` Number of current accounts that are 30 days past due </br>
+`num_active_debit_accounts` Number of currently active bank cards </br>
+`total_debit_limit` Total of all bank card limits </br>
+`num_total_cc_accounts` Total number of credit card accounts in the applicant's history </br>
+`num_open_cc_accounts` Total number of currently open credit card accounts </br>
+`num_cc_carrying_balance` Number of credit cards that are carrying a balance </br>
+`num_mort_accounts` Number of mortgage accounts </br>
+`account_never_delinq_percent` Percent of all lines of credit where the applicant was never delinquent </br>
+`tax_liens` a numeric vector </br>
+`public_record_bankrupt` Number of bankruptcies listed in the public record for this applicant </br>
+`loan_purpose` The category for the purpose of the loan </br>
+`application_type` The type of application: either individual or joint </br>
+`loan_amount` The amount of the loan the applicant received </br>
+`term` The number of months of the loan the applicant received </br>
+`interest_rate` Interest rate of the loan the applicant received </br>
+`installment` Monthly payment for the loan the applicant received </br>
+`grade` Grade associated with the loan </br>
+`sub_grade` Detailed grade associated with the loan </br>
+`issue_month` Month the loan was issued </br>
+`loan_status` Status of the loan </br>
+`initial_listing_status` Initial listing status of the loan </br>
+`disbursement_method` Disbursement method of the loan </br>
+`balance` Current balance on the loan </br>
+`paid_total` Total that has been paid on the loan by the applicant </br>
+`paid_principal` The difference between the original loan amount and the current balance on the loan </br>
+`paid_interest` The amount of interest paid so far by the applicant </br>
+`paid_late_fees` Late fees paid by the applicant </br>
+:::
+
+```{r}
+#| label: data-overview
+
+loans_full_schema <- read_csv("data/loans_full_schema.csv") |>
+  select(interest_rate, debt_to_income, homeownership,
+         annual_income, loan_amount, grade) |>
+  glimpse()
+
+```
+
+The project will work with a clean analytic subset, removing records with missing
+values on our variables of interest.
+
+```{r}
+#| label: data-clean
+
+loans <- loans_full_schema |>
+  select(interest_rate, debt_to_income, homeownership,
+         annual_income, loan_amount, grade) |>
+  drop_na() |>
+  # Standardise homeownership labels and keep three primary categories
+  filter(homeownership %in% c("RENT", "MORTGAGE", "OWN")) |>
+  mutate(homeownership = factor(homeownership,
+                              levels = c("MORTGAGE", "RENT", "OWN")))
+
+cat("Analytic sample:", nrow(loans), "loans\n")
+```
+
+### Descriptive Summary
+
+```{r}
+#| label: tbl-descriptives
+#| tbl-cap: "Summary statistics for key lending variables."
+
+loans |>
+  summarise(
+    across(
+      c(interest_rate, debt_to_income, annual_income, loan_amount),
+      list(
+        Mean   = \(x) round(mean(x), 2),
+        Median = \(x) round(median(x), 2),
+        SD     = \(x) round(sd(x), 2),
+        Min    = \(x) round(min(x), 2),
+        Max    = \(x) round(max(x), 2)
+      ),
+      .names = "{.col}_{.fn}"
+    )
+  ) |>
+  pivot_longer(everything(),
+               names_to  = c("Variable", "Statistic"),
+               names_sep = "_(?=[^_]+$)") |>
+  pivot_wider(names_from = Statistic, values_from = value)
+```
+
+---
+
+## Model A — Continuous Predictor: Debt-to-Income → Interest Rate
+
+### The Business Question
+
+Does a borrower's **debt-to-income (DTI) ratio** predict the interest rate
+they are offered? From a credit risk standpoint, DTI is a fundamental
+leverage metric: a higher ratio signals less capacity to service new debt,
+which should — all else equal — push rates upward as lenders price in
+additional default risk.
+
+### Visualising the Relationship
+
+```{r}
+#| label: fig-dti-scatter
+#| fig-cap: "Scatter plot of interest rate versus debt-to-income ratio. A positive association is visible despite substantial dispersion."
+
+# Cap DTI at 60 to improve visual legibility (removes a handful of extreme outliers)
+loans |>
+  filter(debt_to_income <= 60) |>
+  ggplot(aes(x = debt_to_income, y = interest_rate)) +
+  geom_point(alpha = 0.25, color = plot_blue, size = 1.2) +
+  geom_smooth(method = "lm", color = plot_red,
+              linewidth = 1, se = TRUE, fill = plot_red, alpha = 0.15) +
+  labs(
+    title    = "Interest Rate vs. Debt-to-Income Ratio",
+    subtitle = "Each point is one loan application  |  OLS trend line with 95% band",
+    x        = "Debt-to-Income Ratio (%)",
+    y        = "Interest Rate (%)",
+    caption  = "Loans with DTI > 60 excluded from plot for visual clarity."
+  )
+```
+
+### Frequentist Baseline
+
+Before stepping into the Bayesian framework it is useful to establish a
+frequentist reference. The ordinary least squares model provides a single
+point estimate for the slope:
+
+```{r}
+#| label: freq-model-a
+
+ols_a <- lm(interest_rate ~ debt_to_income, data = loans)
+summary(ols_a)
+```
+
+```{r}
+#| label: freq-params-a
+
+get_parameters(ols_a)
+```
+
+::: {.callout-note icon = false}
+## Frequentist Reading
+DTI is a **positive and statistically significant** predictor of interest
+rate: β ≈ 0.11, meaning each additional percentage point of DTI is associated
+with roughly **0.11 percentage points higher interest rate**, on average.
+The *p*-value is effectively zero, but it tells us nothing about the *size*
+of this uncertainty — only that it is unlikely under the null. We can do
+better.
+:::
+
+### Fitting the Bayesian Model
+
+`lm()` is replaced with `stan_glm()`. The likelihood and linear structure are
+identical; the difference is that `stan_glm()` uses a Markov Chain Monte
+Carlo (MCMC) algorithm to draw samples from the **posterior distribution**
+of each parameter rather than solving the normal equations for a single
+point estimate.
+
+```{r}
+#| label: bayes-model-a
+#| results: hide
+
+bayes_a <- stan_glm(
+  interest_rate ~ debt_to_income,
+  data   = loans,
+  family = gaussian(),
+  seed   = 2024
+)
+```
+
+::: {.callout-note icon = false}
+## What just happened under the hood?
+`stan_glm()` ran **4 independent chains**, each sampling **2,000
+iterations** with the first 1,000 discarded as warm-up. The result is
+**4 × 1,000 = 4,000 posterior draws** per parameter — 4,000 plausible
+values for the DTI slope, each consistent with the observed data and the
+weakly informative priors.
+:::
+
+### Extracting and Inspecting the Posterior
+
+```{r}
+#| label: posterior-a
+
+post_a <- get_parameters(bayes_a)
+
+cat("Posterior draws:", nrow(post_a), "\n\n")
+head(post_a, 8)
+```
+
+Each row is a draw from the joint posterior — a single internally consistent
+guess at what the intercept *and* the DTI slope could plausibly be. The
+`debt_to_income` column isolates the marginal posterior for the slope that is most
+cared about.
+
+### Visualising the Posterior Distribution
+
+```{r}
+#| label: fig-posterior-a
+#| fig-cap: "Posterior distribution of the debt-to-income slope coefficient. The bulk of the mass sits clearly above zero."
+
+ggplot(post_a, aes(x = debt_to_income)) +
+  geom_density(fill = plot_lightgrey, color = clr_dark,
+               alpha = 0.75, linewidth = 0.8) +
+  geom_vline(xintercept = 0, color = plot_red,
+             linewidth = 0.9, linetype = "dashed") +
+  labs(
+    title    = "Posterior Distribution — DTI Slope",
+    subtitle = "Probability density of plausible β values for debt_to_income",
+    x        = "Coefficient (β)",
+    y        = "Density",
+    caption  = "Dashed red line marks β = 0 (null effect)."
+  )
+```
+
+The distribution is unimodal, roughly symmetric, and sits comfortably to the
+right of zero — providing immediate visual evidence that DTI carries a
+positive effect on interest rates.
+
+---
+
+## Part A — Characterising the Posterior
+
+### Point Estimates
+
+Three natural summaries of the posterior's center are available:
+
+```{r}
+#| label: point-estimates-a
+
+tibble(
+  Estimator = c("Mean", "Median", "MAP (mode)"),
+  Value = c(
+    round(mean(post_a$debt_to_income), 5),
+    round(median(post_a$debt_to_income), 5),
+    round(as.numeric(map_estimate(post_a$debt_to_income)), 5)
+  )
+)
+```
+
+```{r}
+#| label: fig-point-estimates-a
+#| fig-cap: "Point estimates overlaid on the posterior density. All three converge tightly near 0.112."
+
+pe_mean   <- mean(post_a$debt_to_income)
+pe_median <- median(post_a$debt_to_income)
+pe_map    <- as.numeric(map_estimate(post_a$debt_to_income))
+
+ggplot(post_a, aes(x = debt_to_income)) +
+  geom_density(fill = plot_lightgrey, color = "#6B4F0F",
+               alpha = 0.7, linewidth = 0.8) +
+  geom_vline(xintercept = pe_mean,
+             color = clr_dark,     linewidth = 1.1, linetype = "solid") +
+  geom_vline(xintercept = pe_median,
+             color = plot_beige, linewidth = 1.1, linetype = "dashed") +
+  geom_vline(xintercept = pe_map,
+             color = plot_red,   linewidth = 1.1, linetype = "dotdash") +
+  annotate("text", x = pe_mean   - 0.003, y = 55, angle = 90,
+           label = "Mean",   size = 3, color = clr_dark) +
+  annotate("text", x = pe_median + 0.003, y = 55, angle = 90,
+           label = "Median", size = 3, color = plot_beige) +
+  annotate("text", x = pe_map    + 0.003, y = 40, angle = 90,
+           label = "MAP",    size = 3, color = plot_red) +
+  labs(
+    title    = "Point Estimates on the DTI Posterior",
+    subtitle = "Mean (solid), Median (dashed), MAP (dot-dash)",
+    x        = "β (debt_to_income)",
+    y        = "Density"
+  )
+```
+
+::: {.callout-note icon = false}
+## Which point estimate should be reported?
+All three are close enough here to make little practical difference. The
+**median** is the conventional recommendation in the Bayesian literature
+because it carries a clean probabilistic meaning: *there is a 50%
+probability the true slope exceeds this value and a 50% probability it
+falls below*. It is also more robust than the mean when posteriors are
+asymmetric or have heavy tails — both realistic conditions in financial data.
+:::
+
+### Credible Intervals
+
+A **credible interval** is the Bayesian analogue of a confidence interval,
+but with a far more intuitive interpretation. The **Highest Density
+Interval (HDI)** is used; it is the shortest continuous region of the posterior containing
+a specified probability mass.
+
+```{r}
+#| label: hdi-a
+
+hdi(post_a$debt_to_income, ci = 0.89)
+```
+
+::: {.callout-note icon = false}
+## Frequentist Reading
+Given the observed loan data, there is an **89% probability** that the
+true effect of DTI on interest rate lies between these two bounds.
+
+This is a direct statement about the parameter — not a long-run frequency
+claim about hypothetical replications. **89%** is used rather than 95%
+following Kruschke (2014) and McElreath (2018): the 89% level tends to
+produce more stable numerical estimates across sampling runs, and the choice
+of any threshold is inherently a convention worth questioning.
+:::
+
+---
+
+## Model B — Categorical Predictor: Homeownership → Interest Rate
+
+### The Business Question
+
+Does a borrower's **homeownership status** affect the interest rate they
+receive? Lenders may view homeowners differently from renters — either as
+lower-risk borrowers (stable housing → stable finances) or as overextended
+ones (mortgage obligations reduce capacity). Bayesian inference 
+quantifies that contrast and its uncertainty simultaneously.
+
+### Sample Composition and Descriptives
+
+```{r}
+#| label: tbl-homeownership
+#| tbl-cap: "Interest rate by homeownership category."
+
+loans |>
+  group_by(homeownership) |>
+  summarise(
+    n          = n(),
+    mean_rate  = round(mean(interest_rate), 2),
+    median_rate = round(median(interest_rate), 2),
+    sd_rate    = round(sd(interest_rate), 2),
+    .groups    = "drop"
+  )
+```
+
+```{r}
+#| label: fig-homeownership-dist
+#| fig-cap: "Distribution of interest rates by homeownership status. Renters tend to receive marginally higher rates; mortgage holders cluster slightly lower."
+
+ggplot(loans, aes(x = interest_rate, fill = homeownership)) +
+  geom_density(alpha = 0.55, linewidth = 0.6) +
+  scale_fill_manual(
+    values = c("RENT"     = plot_red,
+               "MORTGAGE" = plot_beige,
+               "OWN"      = plot_lightgrey),
+    name = "Homeownership"
+  ) +
+  labs(
+    title    = "Interest Rate Distributions by Homeownership Status",
+    subtitle = "Bayesian modelling will quantify the difference in posterior terms",
+    x        = "Interest Rate (%)",
+    y        = "Density"
+  )
+```
+
+### Frequentist Baseline
+
+```{r}
+#| label: freq-model-b
+
+ols_b <- lm(interest_rate ~ homeownership, data = loans)
+summary(ols_b)
+```
+
+```{r}
+#| label: freq-params-b
+
+get_parameters(ols_b)
+```
+
+The reference level is **MORTGAGE**. The coefficients for OWN and RENT
+represent the average difference in interest rate relative to
+mortgage-holding borrowers.
+
+### Fitting the Bayesian Model
+
+```{r}
+#| label: bayes-model-b
+#| results: hide
+
+bayes_b <- stan_glm(
+  interest_rate ~ homeownership,
+  data   = loans,
+  family = gaussian(),
+  seed   = 2024
+)
+```
+
+### Extracting the Posterior Contrasts
+
+```{r}
+#| label: posterior-b
+
+post_b <- get_parameters(bayes_b)
+head(post_b, 6)
+```
+
+The two posterior columns — `homeownershipOWN` and `homeownershipRENT` —
+represent the distribution of plausible *differences* in interest rate
+relative to the MORTGAGE baseline. Every draw is a complete, internally
+consistent estimate of both contrasts.
+
+### Visualising Both Contrasts
+
+```{r}
+#| label: fig-posterior-b
+#| fig-cap: "Posterior distributions of the two homeownership contrasts relative to MORTGAGE borrowers. Both are clearly shifted away from zero."
+
+post_b_long <- post_b |>
+  select(homeownershipOWN, homeownershipRENT) |>
+  pivot_longer(everything(),
+               names_to  = "Contrast",
+               values_to = "Estimate") |>
+  mutate(Contrast = recode(Contrast,
+                           homeownershipOWN  = "OWN vs. MORTGAGE",
+                           homeownershipRENT = "RENT vs. MORTGAGE"))
+
+ggplot(post_b_long, aes(x = Estimate, fill = Contrast)) +
+  geom_density(alpha = 0.65, linewidth = 0.7) +
+  geom_vline(xintercept = 0, color = clr_dark,
+             linewidth = 0.9, linetype = "dashed") +
+  scale_fill_manual(
+    values = c("OWN vs. MORTGAGE"  = plot_lightgrey,
+               "RENT vs. MORTGAGE" = plot_red),
+    name = "Contrast"
+  ) +
+  labs(
+    title    = "Posterior Distributions — Homeownership Contrasts",
+    subtitle = "Reference category: MORTGAGE  |  Dashed line marks zero difference",
+    x        = "Rate Difference (pp)",
+    y        = "Density"
+  )
+```
+
+---
+
+## Part B — Characterising the Categorical Model Posterior
+
+### Point Estimates and Credible Intervals
+
+```{r}
+#| label: point-estimates-b
+
+tibble(
+  Contrast  = c("OWN vs. MORTGAGE", "RENT vs. MORTGAGE"),
+  Median    = c(round(median(post_b$homeownershipOWN), 3),
+                round(median(post_b$homeownershipRENT), 3)),
+  Mean      = c(round(mean(post_b$homeownershipOWN), 3),
+                round(mean(post_b$homeownershipRENT), 3))
+)
+```
+
+```{r}
+#| label: hdi-b
+
+hdi(post_b$homeownershipOWN,  ci = 0.89)
+hdi(post_b$homeownershipRENT, ci = 0.89)
+```
+
+### Region of Practical Equivalence (ROPE)
+
+The **Region of Practical Equivalence** (ROPE) shifts the question from
+*"Is the effect non-zero?"* to *"Is the effect large enough to matter
+in practice?"* The ROPE is defined as the range of rate differences so small
+they carry no meaningful business or credit risk implications.
+
+The standard data-driven approach uses **one-tenth of the response
+variable's standard deviation** as the half-width:
+
+```{r}
+#| label: rope-bounds-b
+
+rope_bounds_b <- rope_range(bayes_b)
+cat(sprintf("ROPE: [%.3f, %.3f] percentage points\n",
+            rope_bounds_b[1], rope_bounds_b[2]))
+```
+
+```{r}
+#| label: rope-own
+
+rope(post_b$homeownershipOWN, range = rope_bounds_b, ci = 0.89)
+```
+
+```{r}
+#| label: rope-rent
+
+rope(post_b$homeownershipRENT, range = rope_bounds_b, ci = 0.89)
+```
+
+::: {.callout-note icon = false}
+## ROPE interpretation for lending risk
+When **0% of the 89% credible interval falls inside the ROPE**, it can be concluded that
+the effect is *practically significant* — not merely statistically detectable.
+A ROPE overlap of more than 5–10% would suggest the effect, while real, may
+be too small to drive material pricing decisions.
+
+In a lending context, a rate difference of less than ±`r round(abs(rope_bounds_b[1]), 2)` percentage points would be considered commercially negligible. Any effect outside this
+band warrants attention in a pricing or risk model.
+:::
+
+### Probability of Direction (pd)
+
+Rather than a binary significant/non-significant verdict, the **Probability
+of Direction** (pd) provides a confidence level regarding the *sign* of an
+effect — the proportion of posterior draws on the same side of zero as the
+median.
+
+```{r}
+#| label: pd-b
+
+p_direction(post_b$homeownershipOWN)
+p_direction(post_b$homeownershipRENT)
+```
+
+::: {.callout-note icon = false}
+## Translating pd to familiar terms
+The pd maps approximately to the one-sided frequentist *p*-value:
+
+$$p_{\text{two-sided}} \approx 2 \times (1 - pd)$$
+
+A pd of 99% corresponds to roughly *p* = 0.02 — but unlike the *p*-value,
+the pd has a natural language interpretation: *"There is a 99% probability
+that this effect is positive."* No repeated-sampling thought experiment
+required.
+:::
+
+---
+
+## Unified Summary: `describe_posterior()`
+
+Rather than assembling these indices one at a time, `bayestestR` provides
+`describe_posterior()` — a single function that computes the median, HDI, pd,
+ROPE percentage, Bayes Factor, and MCMC diagnostics in one call.
+
+### Model A — Continuous (DTI)
+
+```{r}
+#| label: describe-a
+
+describe_posterior(
+  bayes_a,
+  test     = c("p_direction", "rope", "bayesfactor"),
+  ci       = 0.89,
+  ci_method = "HDI"
+)
+```
+
+### Model B — Categorical (Homeownership)
+
+```{r}
+#| label: describe-b
+
+describe_posterior(
+  bayes_b,
+  test      = c("p_direction", "rope", "bayesfactor"),
+  ci        = 0.89,
+  ci_method = "HDI"
+)
+```
+
+#### Reading the describe_posterior() output
+```{r}
+#| lable: describe_posterior_table
+"Column" <- c(
+            "Median",
+            "CI_low / CI_high",
+            "pd",
+            "% in ROPE",
+            "BF",
+            "Rhat",
+            "ESS")
+
+"Interpretation" <- c(
+            "Preferred point estimate; 50th percentile of the posterior",
+            "89% HDI bounds — the highest-density region of the posterior",
+            "Probability of Direction — confidence in the sign of the effect",
+            "Share of the 89% HDI overlapping the practical-equivalence zone",
+            "Bayes Factor — evidence ratio against a point-null model",
+            "Convergence diagnostic; values ≤ 1.01 indicate good MCMC mixing",
+            "Effective Sample Size; a proxy for posterior estimate precision"
+            )
+
+tblData <- tibble(Column, Interpretation)
+
+kbl(tblData) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## Conclusions & Risk Implications
+
+Two lending risk questions, two Bayesian models, one consistent framework:
+
+**Debt-to-Income (DTI)** carries a reliable positive association with
+interest rates. The posterior is entirely above zero, and the 89% HDI sits
+well outside the ROPE — meaning the effect is not only statistically credible
+but practically material. In portfolio terms: a borrower population shifting
+upward in DTI is likely facing meaningfully higher cost of capital.
+
+**Homeownership status** differentiates rate outcomes in ways that are both
+credible and practically significant. RENT borrowers face a systematically
+higher rate than MORTGAGE holders; OWN borrowers sit in between. These
+contrasts are robust across both the ROPE test and the pd, suggesting that
+housing-tenure information should enter any serious underwriting or pricing
+model.
+
+From a credit risk standpoint, this distinction between RENT, OWN, and MORTGAGE borrowers matters in a nuanced way that is worth calling out here. 
+
+  ⦁  RENT borrowers have no housing asset on their personal balance sheet, which may signal lower net worth or less financial stability — hence the higher interest rates we see in the data.
+
+  ⦁  MORTGAGE borrowers carry a secured debt obligation but also hold a real asset with equity, and lenders may view the discipline of consistent mortgage payments as a positive credit signal.
+
+  ⦁  OWN borrowers might seem like the lowest-risk group (no housing debt, real asset fully owned), but in the lending data they often sit between RENT and MORTGAGE on interest rates — possibly because outright owners tend to be older or have lower incomes, or because their loan applications involve smaller amounts where lender pricing is less differentiated.
+
+This last point — OWN not being the clear lowest-rate group — is actually an interesting finding and is highlighted since it runs counter to the naive intuition that zero housing debt = best credit profile.
+
+The Bayesian approach adds dimensions of inference that frequentist regression structurally cannot provide. Here are the top three for risk stakeholders:
+
+**1. A probability statement about the parameter, not just about the data**
+
+The frequentist p-value answers a question no credit officer or risk committee ever actually asked: "If the true effect were exactly zero, how often would we observe data this extreme across infinite hypothetical replications?" The Bayesian posterior inverts this. After observing the loan data, we can say directly: "There is an 89% probability that the true DTI effect falls between these two values." That is a statement about the parameter given the data — the direction of inference that matches how analysts and decision-makers actually think. Regulatory model risk governance frameworks increasingly require quantified uncertainty and explainable outputs; a posterior distribution satisfies both requirements more naturally than a point estimate with a significance star.
+
+**2. A principled uncertainty envelope that is honest about data quality**
+
+The 89% HDI is not a fixed-width band — it is a direct reflection of how much information the data actually contain. A wide HDI signals that many parameter values remain plausible; a narrow one signals the opposite. For a lending book, this is operationally useful: a model fit on a thin borrower segment will produce a wide HDI, which is itself information — a natural flag to treat that segment's estimates with greater caution and more conservative pricing.
+
+**3. A practical significance test calibrated to the business problem**
+
+The conventional α = 0.05 threshold is not derived from any property of the lending market or the economic cost of a pricing error — it is a legacy convention applied by habit. The ROPE replaces it with a domain-calibrated threshold: in this analysis, a rate difference smaller than ±0.34 percentage points was defined as commercially immaterial. That boundary can come from the data, from a pricing desk's business rules, or from a capital allocation policy — all more defensible than an arbitrary alpha. Critically, when a large sample drives p → 0 for a trivially small effect, the ROPE will correctly identify that the effect is real but irrelevant — a distinction between statistical detectability and practical materiality that is fundamental to sound risk modelling.
+
+
+## References
+
+Bray, A., Çetinkaya-Rundel, M., & Hardin, J. (2023). *openintro: Data sets
+and supplemental functions from OpenIntro textbooks*. R package.
+<https://CRAN.R-project.org/package=openintro>
+
+Cohen, J. (1988). *Statistical power analysis for the social sciences*
+(2nd ed.). Lawrence Erlbaum.
+
+Goodrich, B., Gabry, J., Ali, I., & Brilleman, S. (2023). *rstanarm:
+Bayesian applied regression modeling via Stan*. R package.
+<https://mc-stan.org/rstanarm/>
+
+Kruschke, J. (2014). *Doing Bayesian data analysis: A tutorial with R, JAGS,
+and Stan* (2nd ed.). Academic Press.
+
+Makowski, D., Ben-Shachar, M. S., & Lüdecke, D. (2019). bayestestR:
+Describing effects and their uncertainty, existence and significance within
+the Bayesian framework. *Journal of Open Source Software, 4*(40), 1541.
+<https://doi.org/10.21105/joss.01541>
+
+McElreath, R. (2018). *Statistical rethinking: A Bayesian course with
+examples in R and Stan*. Chapman & Hall/CRC.
+
+---
+
+*Rendered with [Quarto](https://quarto.org/) · Packages: `bayestestR`, `dplyr`,
+ `ggplot2`, `insight`, `kableExtra`, `openintro`, `rstanarm` , `scales`, `tidyr`, `tidyverse`*
